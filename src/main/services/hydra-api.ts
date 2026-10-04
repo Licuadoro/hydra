@@ -61,6 +61,10 @@ export class HydraApi {
   }
 
   public static hasActiveSubscription() {
+    // Hydrogenium [By LICUADO]: all cloud benefits are included for free, so
+    // every logged-in user is treated as an active subscriber.
+    if (this.isLoggedIn()) return true;
+
     const expiresAt = new Date(this.userAuth.subscription?.expiresAt ?? 0);
     return expiresAt > new Date();
   }

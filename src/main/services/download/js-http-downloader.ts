@@ -3,6 +3,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { logger } from "../logger";
+import { acceleratedDownload } from "./multi-connection-downloader";
 import {
   applySkip,
   clampProgress,
@@ -104,6 +105,45 @@ export class JsHttpDownloader {
     }
 
     this.resetThrottleWindow();
+  }
+
+  // Hydrogenium download accelerator: when no manual speed cap is set, the
+  // file is fetched over several parallel byte-range connections, which is
+  // dramatically faster than a single sequential stream on most hosts.
+  private canUseAccelerator(): boolean {
+    return this.maxDownloadSpeedBytesPerSecond === null;
+  }
+
+  private async runAcceleratedDownload(
+    url: string,
+    requestHeaders: Record<string, string>,
+    filePath: string
+  ): Promise<void> {
+    await acceleratedDownload({
+      url,
+      savePath: path.dirname(filePath),
+      filename: path.basename(filePath),
+      headers: requestHeaders,
+      signal: this.abortController?.signal,
+      onProgress: (downloadedBytes, totalBytes) => {
+        const clamped = Math.min(Math.max(downloadedBytes, 0), totalBytes);
+        if (totalBytes > 0) this.fileSize = totalBytes;
+        this.bytesDownloaded = clamped;
+        this.updateSpeed();
+      },
+    });
+
+    this.status = "complete";
+    this.retryCount = 0;
+    this.statusRetryCount = 0;
+    this.budgetResets = 0;
+    this.restartCount = 0;
+    this.isReconnecting = false;
+    this.resetRecoveryState();
+    this.downloadSpeed = 0;
+    logger.log(
+      `[JsHttpDownloader] Accelerated download complete (${this.bytesDownloaded} bytes)`
+    );
   }
 
   async startDownload(options: JsHttpDownloaderOptions): Promise<void> {
@@ -611,6 +651,47 @@ export class JsHttpDownloader {
 
     if (!response.body) {
       throw new Error("Response body is null");
+    }
+
+    // Fresh downloads with no manual speed cap go through the Hydrogenium
+    // multi-connection accelerator; resumed partials and capped downloads keep
+    // using the single sequential stream (with its byte-exact recovery logic).
+    if (startByte === 0 && this.canUseAccelerator()) {
+      const headerFilename = this.parseContentDisposition(response);
+      if (headerFilename) {
+        if (headerFilename !== path.basename(actualFilePath)) {
+          logger.log(
+            `[JsHttpDownloader] Filename mismatch detected. URL-derived="${path.basename(
+              actualFilePath
+            )}" header-derived="${headerFilename}"`
+          );
+        }
+        actualFilePath = path.join(savePath, headerFilename);
+        this.folderName = headerFilename;
+        this.resolvedFilename = headerFilename;
+        const targetDir = path.dirname(actualFilePath);
+        if (!fs.existsSync(targetDir)) {
+          fs.mkdirSync(targetDir, { recursive: true });
+        }
+        logger.log(
+          `[JsHttpDownloader] Using filename from Content-Disposition: ${headerFilename}`
+        );
+      } else if (this.resolvedFilename === null) {
+        this.resolvedFilename = path.basename(actualFilePath);
+        if (usedFallback) {
+          logger.log(
+            "[JsHttpDownloader] Content-Disposition filename not found, using fallback filename"
+          );
+        }
+      }
+
+      try {
+        await this.runAcceleratedDownload(url, requestHeaders, actualFilePath);
+      } finally {
+        // The probe response was only used for metadata; release its body.
+        response.body.cancel().catch(() => undefined);
+      }
+      return;
     }
 
     this.writeStream = fs.createWriteStream(actualFilePath, { flags });
